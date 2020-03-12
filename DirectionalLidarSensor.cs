@@ -14,7 +14,7 @@ using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using UnityEngine;
 using UnityEngine.Rendering;
-using UnityEngine.Experimental.Rendering.HDPipeline;
+using UnityEngine.Rendering.HighDefinition;
 using Simulator.Bridge;
 using Simulator.Bridge.Data;
 using Simulator.Utilities;
@@ -168,7 +168,7 @@ namespace Simulator.Sensors
                 context.SetupCameraProperties(camera);
 
                 var cmd = CommandBufferPool.Get();
-                hd.SetupGlobalParams(cmd, 0, 0, 0);
+                hd.SetupGlobalParams(cmd, 0);
                 cmd.ClearRenderTarget(true, true, Color.black);
                 context.ExecuteCommandBuffer(cmd);
                 CommandBufferPool.Release(cmd);
