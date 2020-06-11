@@ -90,8 +90,8 @@ namespace Simulator.Sensors
 
         private float CosHorizontalAngle = 0f;
 
-        IBridge Bridge;
-        IWriter<PointCloudData> Writer;
+        BridgeInstance Bridge;
+        Publisher<PointCloudData> Publish;
         uint SendSequence;
 
         [NativeDisableContainerSafetyRestriction]
@@ -150,10 +150,10 @@ namespace Simulator.Sensors
         ProfilerMarker BeginReadMarker = new ProfilerMarker("Lidar.BeginRead");
         ProfilerMarker EndReadMarker = new ProfilerMarker("Lidar.EndRead");
 
-        public override void OnBridgeSetup(IBridge bridge)
+        public override void OnBridgeSetup(BridgeInstance bridge)
         {
             Bridge = bridge;
-            Writer = bridge.AddWriter<PointCloudData>(Topic);
+            Publish = bridge.AddPublisher<PointCloudData>(Topic);
         }
 
         public void CustomRender(ScriptableRenderContext context, HDCamera hd)
@@ -256,7 +256,7 @@ namespace Simulator.Sensors
 
             int count = LaserCount * MeasurementsPerRotation;
             PointCloudBuffer = new ComputeBuffer(count, UnsafeUtility.SizeOf<Vector4>());
-            PointCloudMaterial?.SetBuffer("_PointCloud", PointCloudBuffer);
+            PointCloudMaterial.SetBuffer("_PointCloud", PointCloudBuffer);
 
             Points = new NativeArray<Vector4>(count, Allocator.Persistent);
 
@@ -640,7 +640,7 @@ namespace Simulator.Sensors
 
                 Task.Run(() =>
                 {
-                    Writer.Write(new PointCloudData()
+                    Publish(new PointCloudData()
                     {
                         Name = Name,
                         Frame = Frame,
