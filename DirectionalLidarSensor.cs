@@ -8,7 +8,6 @@
 using System;
 using System.Threading.Tasks;
 using System.Collections.Generic;
-using Unity.Jobs;
 using Unity.Profiling;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
@@ -18,6 +17,7 @@ using UnityEngine.Rendering.HighDefinition;
 using Simulator.Bridge;
 using Simulator.Bridge.Data;
 using Simulator.Utilities;
+using Simulator.PointCloud;
 using Simulator.Sensors.UI;
 
 namespace Simulator.Sensors
@@ -25,6 +25,27 @@ namespace Simulator.Sensors
     [SensorType("DirectionalLidar", new[] { typeof(PointCloudData) })]
     public partial class DirectionalLidarSensor : SensorBase
     {
+        private static class Properties
+        {
+            public static readonly int Input = Shader.PropertyToID("_Input");
+            public static readonly int Output = Shader.PropertyToID("_Output");
+            public static readonly int Index = Shader.PropertyToID("_Index");
+            public static readonly int Count = Shader.PropertyToID("_Count");
+            public static readonly int LaserCount = Shader.PropertyToID("_LaserCount");
+            public static readonly int MeasuresPerRotation = Shader.PropertyToID("_MeasurementsPerRotation");
+            public static readonly int Origin = Shader.PropertyToID("_Origin");
+            public static readonly int Transform = Shader.PropertyToID("_Transform");
+            public static readonly int ScaleDistance = Shader.PropertyToID("_ScaleDistance");
+            public static readonly int TexSize = Shader.PropertyToID("_TexSize");
+            public static readonly int DirLidarStart = Shader.PropertyToID("_DirLidarStart");
+            public static readonly int DirLidarForward = Shader.PropertyToID("_DirLidarForward");
+            public static readonly int DirLidarDeltaX = Shader.PropertyToID("_DirLidarDeltaX");
+            public static readonly int DirLidarDeltaY = Shader.PropertyToID("_DirLidarDeltaY");
+            public static readonly int DirLidarMaxRayCount = Shader.PropertyToID("_DirLidarMaxRayCount");
+            public static readonly int DirLidarStartRay = Shader.PropertyToID("_DirLidarStartRay");
+            public static readonly int CosAngle = Shader.PropertyToID("_CosAngle");
+        }
+        
         // Lidar x is forward, y is left, z is up
         public static readonly Matrix4x4 LidarTransform = new Matrix4x4(new Vector4(0, -1, 0, 0), new Vector4(0, 0, 1, 0), new Vector4(1, 0, 0, 0), Vector4.zero);
 
@@ -103,12 +124,14 @@ namespace Simulator.Sensors
         Material PointCloudMaterial;
 
         private Camera Camera;
-        private bool updated;
+
+        private SensorRenderTarget activeTarget;
+        private ShaderTagId passId;
+        private ComputeShader cs;
 
         struct ReadRequest
         {
-            public RenderTexture RenderTexture;
-            public AsyncGPUReadbackRequest Readback;
+            public SensorRenderTarget TextureSet;
             public int Index;
             public int Count;
             public int MaxRayCount;
@@ -127,9 +150,8 @@ namespace Simulator.Sensors
         }
 
         List<ReadRequest> Active = new List<ReadRequest>();
-        List<JobHandle> Jobs = new List<JobHandle>();
 
-        Stack<RenderTexture> AvailableRenderTextures = new Stack<RenderTexture>();
+        Stack<SensorRenderTarget> AvailableRenderTextures = new Stack<SensorRenderTarget>();
         Stack<Texture2D> AvailableTextures = new Stack<Texture2D>();
 
         int CurrentIndex;
@@ -158,27 +180,10 @@ namespace Simulator.Sensors
 
         public void CustomRender(ScriptableRenderContext context, HDCamera hd)
         {
-            var camera = hd.camera;
-
-            ScriptableCullingParameters culling;
-            if (camera.TryGetCullingParameters(out culling))
-            {
-                var cull = context.Cull(ref culling);
-
-                context.SetupCameraProperties(camera);
-
-                var cmd = CommandBufferPool.Get();
-                hd.SetupGlobalParams(cmd, 0);
-                cmd.ClearRenderTarget(true, true, Color.black);
-                context.ExecuteCommandBuffer(cmd);
-                CommandBufferPool.Release(cmd);
-
-                var sorting = new SortingSettings(camera);
-                var drawing = new DrawingSettings(new ShaderTagId("SimulatorLidarPass"), sorting);
-                var filter = new FilteringSettings(RenderQueueRange.all);
-
-                context.DrawRenderers(cull, ref drawing, ref filter);
-            }
+            var cmd = CommandBufferPool.Get();
+            SensorPassRenderer.Render(context, cmd, hd, activeTarget, passId, Color.clear);
+            PointCloudManager.RenderLidar(context, cmd, hd, activeTarget.ColorHandle, activeTarget.DepthHandle);
+            CommandBufferPool.Release(cmd);
         }
 
         public void Init()
@@ -187,6 +192,8 @@ namespace Simulator.Sensors
             Camera.GetComponent<HDAdditionalCameraData>().customRender += CustomRender;
             PointCloudMaterial = new Material(RuntimeSettings.Instance.PointCloudShader);
             PointCloudLayer = LayerMask.NameToLayer("Sensor Effects");
+            passId = new ShaderTagId("SimulatorLidarPass");
+            cs = Instantiate(RuntimeSettings.Instance.LidarComputeShader);
             
             Reset();
         }
@@ -200,13 +207,9 @@ namespace Simulator.Sensors
         {
             Active.ForEach(req =>
             {
-                req.Readback.WaitForCompletion();
-                req.RenderTexture.Release();
+                req.TextureSet.Release();
             });
             Active.Clear();
-
-            Jobs.ForEach(job => job.Complete());
-            Jobs.Clear();
 
             foreach (var tex in AvailableRenderTextures)
             {
@@ -277,13 +280,9 @@ namespace Simulator.Sensors
         {
             Active.ForEach(req =>
             {
-                req.Readback.WaitForCompletion();
-                req.RenderTexture.Release();
+                req.TextureSet.Release();
             });
             Active.Clear();
-
-            Jobs.ForEach(job => job.Complete());
-            Jobs.Clear();
         }
 
         void Update()
@@ -305,56 +304,30 @@ namespace Simulator.Sensors
 
             UpdateMarker.Begin();
 
-            updated = false;
-            while (Jobs.Count > 0 && Jobs[0].IsCompleted)
+            var cmd = CommandBufferPool.Get();
+            foreach (var req in Active)
             {
-                updated = true;
-                Jobs.RemoveAt(0);
-            }
-
-            bool jobsIssued = false;
-            while (Active.Count > 0)
-            {
-                var req = Active[0];
-                if (!req.RenderTexture.IsCreated())
+                if (!req.TextureSet.IsValid(RenderTextureWidth, RenderTextureHeight))
                 {
                     // lost render texture, probably due to Unity window resize or smth
-                    req.Readback.WaitForCompletion();
-                    req.RenderTexture.Release();
-                }
-                else if (req.Readback.done)
-                {
-                    if (req.Readback.hasError)
-                    {
-                        Debug.Log("Failed to read GPU texture");
-                        req.RenderTexture.Release();
-                        IgnoreNewRquests = 1.0f;
-                    }
-                    else
-                    {
-                        jobsIssued = true;
-                        var job = EndReadRequest(req, req.Readback.GetData<byte>());
-                        Jobs.Add(job);
-                        AvailableRenderTextures.Push(req.RenderTexture);
-
-                        if (req.Index + req.Count >= CurrentMeasurementsPerRotation)
-                        {
-                            SendMessage();
-                        }
-                    }
+                    req.TextureSet.Release();
                 }
                 else
                 {
-                    break;
+                    EndReadRequest(cmd, req);
+                    AvailableRenderTextures.Push(req.TextureSet);
+
+                    if (req.Index + req.Count >= CurrentMeasurementsPerRotation)
+                    {
+                        SendMessage();
+                    }
                 }
-
-                Active.RemoveAt(0);
             }
 
-            if (jobsIssued)
-            {
-                JobHandle.ScheduleBatchedJobs();
-            }
+            HDRPUtilities.ExecuteAndClearCommandBuffer(cmd);
+            CommandBufferPool.Release(cmd);
+
+            Active.Clear();
 
             if (IgnoreNewRquests > 0)
             {
@@ -380,7 +353,6 @@ namespace Simulator.Sensors
                     var req = new ReadRequest();
                     if (BeginReadRequest(count, AngleStart, HorizontalAngleLimit, ref req))
                     {
-                        req.Readback = AsyncGPUReadback.Request(req.RenderTexture, 0);
                         Active.Add(req);
                     }
 
@@ -401,11 +373,8 @@ namespace Simulator.Sensors
         {
             Active.ForEach(req =>
             {
-                req.Readback.WaitForCompletion();
-                req.RenderTexture.Release();
+                req.TextureSet.Release();
             });
-
-            Jobs.ForEach(job => job.Complete());
 
             foreach (var tex in AvailableRenderTextures)
             {
@@ -438,24 +407,22 @@ namespace Simulator.Sensors
 
             BeginReadMarker.Begin();
 
-            RenderTexture texture = null;
+            SensorRenderTarget renderTarget = null;
             if (AvailableRenderTextures.Count != 0)
+                renderTarget = AvailableRenderTextures.Pop();
+
+            if (renderTarget == null)
             {
-                texture = AvailableRenderTextures.Pop();
-                if (!texture.IsCreated())
-                {
-                    texture.Release();
-                    texture = null;
-                }
+                renderTarget = SensorRenderTarget.Create2D(RenderTextureWidth, RenderTextureHeight);
+            }
+            else if (!renderTarget.IsValid(RenderTextureWidth, RenderTextureHeight))
+            {
+                renderTarget.Release();
+                renderTarget = SensorRenderTarget.Create2D(RenderTextureWidth, RenderTextureHeight);
             }
 
-            if (texture == null)
-            {
-                texture = new RenderTexture(RenderTextureWidth, RenderTextureHeight, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
-            }
-            texture.Create();
-
-            Camera.targetTexture = texture;
+            activeTarget = renderTarget;
+            Camera.targetTexture = renderTarget;
             Camera.Render();
 
             var pos = Camera.transform.position;
@@ -478,7 +445,7 @@ namespace Simulator.Sensors
 
             req = new ReadRequest()
             {
-                RenderTexture = texture,
+                TextureSet = renderTarget,
                 Index = CurrentIndex,
                 Count = count,
                 MaxRayCount = maxRayCount,
@@ -504,128 +471,31 @@ namespace Simulator.Sensors
             return true;
         }
 
-        struct UpdatePointCloudJob : IJob
-        {
-            [ReadOnly, DeallocateOnJobCompletion]
-            public NativeArray<byte> Input;
-
-            [WriteOnly, NativeDisableContainerSafetyRestriction]
-            public NativeArray<Vector4> Output;
-
-            public int Index;
-            public int Count;
-            public int MaxRayCount;
-            public int StartRay;
-            public float CosAngle;
-
-            public Vector3 Origin;
-            public Vector3 Start;
-            public Vector3 DeltaX;
-            public Vector3 DeltaY;
-            public Vector3 Forward;
-
-            public Matrix4x4 Transform;
-
-            public int LaserCount;
-            public int MeasurementsPerRotation;
-            public int TextureWidth;
-            public int TextureHeight;
-
-            public float MinDistance;
-            public float MaxDistance;
-
-            public bool Compensated;
-
-            public static float DecodeFloatRGB(byte r, byte g, byte b)
-            {
-                return (r / 255.0f) + (g / 255.0f) / 255.0f + (b / 255.0f) / 65025.0f;
-            }
-
-            public void Execute()
-            {
-                var startDir = Start + StartRay * DeltaY;
-
-                for (int j = 0; j < LaserCount; j++)
-                {
-                    var dir = startDir;
-                    int y = (j + StartRay) * TextureHeight / MaxRayCount;
-                    int yOffset = y * TextureWidth * 4;
-                    int indexOffset = j * MeasurementsPerRotation;
-
-                    for (int i = 0; i < Count; i++)
-                    {
-                        var dirNorm = dir.normalized;
-                        int x = i * TextureWidth / Count;
-
-                        byte r = Input[yOffset + x * 4 + 0];
-                        byte g = Input[yOffset + x * 4 + 1];
-                        byte b = Input[yOffset + x * 4 + 2];
-                        float distance = 2.0f * DecodeFloatRGB(r, g, b);
-
-                        int index = indexOffset + (Index + i) % MeasurementsPerRotation;
-                        if (distance == 0 || Vector3.Dot(dirNorm, Forward) < CosAngle)
-                        {
-                            Output[index] = Vector4.zero;
-                        }
-                        else
-                        {
-                            byte a = Input[yOffset + x * 4 + 3];
-                            float intensity = a / 255.0f;
-
-                            var position = Origin + dirNorm * distance * MaxDistance;
-
-                            if (!Compensated)
-                            {
-                                position = Transform.MultiplyPoint3x4(position);
-                            }
-                            Output[index] = new Vector4(position.x, position.y, position.z, intensity);
-                        }
-
-                        dir += DeltaX;
-                    }
-
-                    startDir += DeltaY;
-                }
-            }
-        }
-
-        JobHandle EndReadRequest(ReadRequest req, NativeArray<byte> textureData)
+        private void EndReadRequest(CommandBuffer cmd, ReadRequest req)
         {
             EndReadMarker.Begin();
 
-            var updateJob = new UpdatePointCloudJob()
-            {
-                Input = new NativeArray<byte>(textureData, Allocator.TempJob),
-                Output = Points,
-
-                Index = req.Index,
-                Count = req.Count,
-                MaxRayCount = req.MaxRayCount,
-                StartRay = req.StartRay,
-
-                Origin = req.Origin,
-                Start = req.Start,
-                DeltaX = req.DeltaX,
-                DeltaY = req.DeltaY,
-                Forward = req.Forward,
-                CosAngle = req.CosAngle,
-
-                Transform = req.Transform,
-
-                LaserCount = CurrentLaserCount,
-                MeasurementsPerRotation = CurrentMeasurementsPerRotation,
-                TextureWidth = RenderTextureWidth,
-                TextureHeight = RenderTextureHeight,
-
-                MinDistance = MinDistance,
-                MaxDistance = MaxDistance,
-
-                Compensated = Compensated,
-            };
+            var kernel = cs.FindKernel(Compensated ? "DirLidarComputeComp" : "DirLidarCompute");
+            cmd.SetComputeTextureParam(cs, kernel, Properties.Input, req.TextureSet.ColorTexture);
+            cmd.SetComputeBufferParam(cs, kernel, Properties.Output, PointCloudBuffer);
+            cmd.SetComputeIntParam(cs, Properties.Index, req.Index);
+            cmd.SetComputeIntParam(cs, Properties.Count, req.Count);
+            cmd.SetComputeIntParam(cs, Properties.LaserCount, CurrentLaserCount);
+            cmd.SetComputeIntParam(cs, Properties.MeasuresPerRotation, CurrentMeasurementsPerRotation);
+            cmd.SetComputeIntParam(cs, Properties.DirLidarMaxRayCount, req.MaxRayCount);
+            cmd.SetComputeIntParam(cs, Properties.DirLidarStartRay, req.StartRay);
+            cmd.SetComputeFloatParam(cs, Properties.CosAngle, req.CosAngle);
+            cmd.SetComputeVectorParam(cs, Properties.Origin, req.Origin);
+            cmd.SetComputeMatrixParam(cs, Properties.Transform, req.Transform);
+            cmd.SetComputeVectorParam(cs, Properties.ScaleDistance, new Vector4(0f, 0f, MinDistance, MaxDistance));
+            cmd.SetComputeVectorParam(cs, Properties.TexSize, new Vector4(RenderTextureWidth, RenderTextureHeight, 1f / RenderTextureWidth, 1f / RenderTextureHeight));
+            cmd.SetComputeVectorParam(cs, Properties.DirLidarStart, req.Start);
+            cmd.SetComputeVectorParam(cs, Properties.DirLidarForward, req.Forward);
+            cmd.SetComputeVectorParam(cs, Properties.DirLidarDeltaX, req.DeltaX);
+            cmd.SetComputeVectorParam(cs, Properties.DirLidarDeltaY, req.DeltaY);
+            cmd.DispatchCompute(cs, kernel, HDRPUtilities.GetGroupSize(req.Count, 8), HDRPUtilities.GetGroupSize(LaserCount, 8), 1);
 
             EndReadMarker.End();
-
-            return updateJob.Schedule();
         }
 
         void SendMessage()
@@ -637,6 +507,9 @@ namespace Simulator.Sensors
                 {
                     worldToLocal = worldToLocal * transform.worldToLocalMatrix;
                 }
+
+                var req = AsyncGPUReadback.RequestIntoNativeArray(ref Points, PointCloudBuffer);
+                req.WaitForCompletion();
 
                 Task.Run(() =>
                 {
@@ -664,47 +537,11 @@ namespace Simulator.Sensors
             int count = (int)(HorizontalAngleLimit / minAngle);
 
             float angle = HorizontalAngleLimit / 2.0f;
-
-            var jobs = new NativeArray<JobHandle>(rotationCount, Allocator.Persistent);
-#if ASYNC
-            var active = new ReadRequest[rotationCount];
-
-            try
-            {
-                for (int i = 0; i < rotationCount; i++)
-                {
-                    var rotation = Quaternion.AngleAxis(angle, Vector3.up);
-                    Camera.transform.localRotation = rotation;
-
-                    if (BeginReadRequest(count, angle, HorizontalAngleLimit, ref active[i]))
-                    {
-                        active[i].Readback = AsyncGPUReadback.Request(active[i].RenderTexture, 0);
-                    }
-
-                    angle += HorizontalAngleLimit;
-                    if (angle >= 360.0f)
-                    {
-                        angle -= 360.0f;
-                    }
-                }
-
-                for (int i = 0; i < rotationCount; i++)
-                {
-                    active[i].Readback.WaitForCompletion();
-                    jobs[i] = EndReadRequest(active[i], active[i].Readback.GetData<byte>());
-                }
-
-                JobHandle.CompleteAll(jobs);
-            }
-            finally
-            {
-                Array.ForEach(active, req => AvailableRenderTextures.Push(req.RenderTexture));
-                jobs.Dispose();
-            }
-#else
             var textures = new Texture2D[rotationCount];
 
+            var cmd = CommandBufferPool.Get();
             var rt = RenderTexture.active;
+
             try
             {
                 for (int i = 0; i < rotationCount; i++)
@@ -715,7 +552,7 @@ namespace Simulator.Sensors
                     var req = new ReadRequest();
                     if (BeginReadRequest(count, angle, HorizontalAngleLimit, ref req))
                     {
-                        RenderTexture.active = req.RenderTexture;
+                        RenderTexture.active = req.TextureSet;
                         Texture2D texture;
                         if (AvailableTextures.Count > 0)
                         {
@@ -727,9 +564,9 @@ namespace Simulator.Sensors
                         }
                         texture.ReadPixels(new Rect(0, 0, RenderTextureWidth, RenderTextureHeight), 0, 0);
                         textures[i] = texture;
-                        jobs[i] = EndReadRequest(req, texture.GetRawTextureData<byte>());
+                        EndReadRequest(cmd, req);
 
-                        AvailableRenderTextures.Push(req.RenderTexture);
+                        AvailableRenderTextures.Push(req.TextureSet);
                     }
 
                     angle += HorizontalAngleLimit;
@@ -738,16 +575,17 @@ namespace Simulator.Sensors
                         angle -= 360.0f;
                     }
                 }
-
-                JobHandle.CompleteAll(jobs);
             }
             finally
             {
+                HDRPUtilities.ExecuteAndClearCommandBuffer(cmd);
+                CommandBufferPool.Release(cmd);
                 RenderTexture.active = rt;
                 Array.ForEach(textures, AvailableTextures.Push);
-                jobs.Dispose();
             }
-#endif
+
+            var readback = AsyncGPUReadback.RequestIntoNativeArray(ref Points, PointCloudBuffer);
+            readback.WaitForCompletion();
 
             return Points;
         }
@@ -761,9 +599,8 @@ namespace Simulator.Sensors
 
             float angle = HorizontalAngleLimit / 2.0f;
 
-            var jobs = new NativeArray<JobHandle>(rotationCount, Allocator.Persistent);
-
             var active = new ReadRequest[rotationCount];
+            var cmd = CommandBufferPool.Get();
 
             try
             {
@@ -772,10 +609,7 @@ namespace Simulator.Sensors
                     var rotation = Quaternion.AngleAxis(angle, Vector3.up);
                     Camera.transform.localRotation = rotation;
 
-                    if (BeginReadRequest(count, angle, HorizontalAngleLimit, ref active[i]))
-                    {
-                        active[i].Readback = AsyncGPUReadback.Request(active[i].RenderTexture, 0);
-                    }
+                    BeginReadRequest(count, angle, HorizontalAngleLimit, ref active[i]);
 
                     angle += HorizontalAngleLimit;
                     if (angle >= 360.0f)
@@ -786,17 +620,18 @@ namespace Simulator.Sensors
 
                 for (int i = 0; i < rotationCount; i++)
                 {
-                    active[i].Readback.WaitForCompletion();
-                    jobs[i] = EndReadRequest(active[i], active[i].Readback.GetData<byte>());
+                    EndReadRequest(cmd, active[i]);
                 }
-
-                JobHandle.CompleteAll(jobs);
             }
             finally
             {
-                Array.ForEach(active, req => AvailableRenderTextures.Push(req.RenderTexture));
-                jobs.Dispose();
+                HDRPUtilities.ExecuteAndClearCommandBuffer(cmd);
+                CommandBufferPool.Release(cmd);
+                Array.ForEach(active, req => AvailableRenderTextures.Push(req.TextureSet));
             }
+
+            var readback = AsyncGPUReadback.RequestIntoNativeArray(ref Points, PointCloudBuffer);
+            readback.WaitForCompletion();
 
             var worldToLocal = LidarTransform;
             if (Compensated)
@@ -830,11 +665,6 @@ namespace Simulator.Sensors
         public override void OnVisualize(Visualizer visualizer)
         {
             VisualizeMarker.Begin();
-            if (updated)
-            {
-                PointCloudBuffer.SetData(Points);
-            }
-
             var lidarToWorld = Compensated ? Matrix4x4.identity : transform.localToWorldMatrix;
             PointCloudMaterial.SetMatrix("_LocalToWorld", lidarToWorld);
             PointCloudMaterial.SetFloat("_Size", PointSize * Utility.GetDpiScale());
