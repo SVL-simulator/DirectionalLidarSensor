@@ -1,4 +1,5 @@
 {
+  "id": "29e8757b-efc6-46ca-9b30-99335b8bf697",
   "name": "Directional LiDAR",
   "accessType": "public",
   "description": "Example of directional non-spinning solid state LiDAR.",
