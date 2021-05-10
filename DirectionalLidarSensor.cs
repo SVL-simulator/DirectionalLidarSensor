@@ -185,7 +185,7 @@ namespace Simulator.Sensors
             CommandBufferPool.Release(cmd);
         }
 
-        public void Init()
+        protected override void Initialize()
         {
             Camera = GetComponentInChildren<Camera>();
             Camera.GetComponent<HDAdditionalCameraData>().customRender += CustomRender;
@@ -197,9 +197,28 @@ namespace Simulator.Sensors
             Reset();
         }
 
-        private void Start()
+        protected override void Deinitialize()
         {
-            Init();
+            Active.ForEach(req =>
+            {
+                req.TextureSet.Release();
+            });
+
+            foreach (var tex in AvailableRenderTextures)
+            {
+                tex.Release();
+            }
+            foreach (var tex in AvailableTextures)
+            {
+                DestroyImmediate(tex);
+            }
+
+            PointCloudBuffer.Release();
+
+            if (PointCloudMaterial != null)
+            {
+                DestroyImmediate(PointCloudMaterial);
+            }
         }
 
         public void Reset()
@@ -361,30 +380,6 @@ namespace Simulator.Sensors
             }
 
             UpdateMarker.End();
-        }
-
-        public void OnDestroy()
-        {
-            Active.ForEach(req =>
-            {
-                req.TextureSet.Release();
-            });
-
-            foreach (var tex in AvailableRenderTextures)
-            {
-                tex.Release();
-            }
-            foreach (var tex in AvailableTextures)
-            {
-                DestroyImmediate(tex);
-            }
-
-            PointCloudBuffer.Release();
-
-            if (PointCloudMaterial != null)
-            {
-                DestroyImmediate(PointCloudMaterial);
-            }
         }
 
         bool BeginReadRequest(int count, float angleStart, float angleUse, ref ReadRequest req)
