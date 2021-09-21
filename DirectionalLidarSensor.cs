@@ -124,10 +124,11 @@ namespace Simulator.Sensors
 
         private Camera sensorCamera;
         private HDAdditionalCameraData hdAdditionalCameraData;
-        private Vector4[] Points;
 
         private ComputeBuffer PointCloudBuffer;
         private ComputeBuffer LatitudeAnglesBuffer;
+
+        private GpuReadbackPool<GpuReadbackData<Vector4>, Vector4> ReadbackPool;
 
         private ProfilerMarker RenderMarker = new ProfilerMarker("Lidar.Render");
         private ProfilerMarker ComputeMarker = new ProfilerMarker("Lidar.Compute");
@@ -175,6 +176,8 @@ namespace Simulator.Sensors
             PointCloudMaterial = new Material(RuntimeSettings.Instance.PointCloudShader);
             HDAdditionalCameraData.hasPersistentHistory = true;
             HDAdditionalCameraData.customRender += CustomRender;
+            ReadbackPool = new GpuReadbackPool<GpuReadbackData<Vector4>, Vector4>();
+            ReadbackPool.Initialize(GetTotalRayCount(), OnReadbackComplete);
 
             Reset();
         }
@@ -189,6 +192,13 @@ namespace Simulator.Sensors
 
             LatitudeAnglesBuffer?.Release();
             LatitudeAnglesBuffer = null;
+        }
+
+        private int GetTotalRayCount()
+        {
+            var usedMeasurementsPerRotation = (int) (MeasurementsPerRotation * HorizontalAngle / 360f);
+            var totalCount = LaserCount * usedMeasurementsPerRotation;
+            return totalCount;
         }
 
         private void Reset()
@@ -275,7 +285,7 @@ namespace Simulator.Sensors
 
             var totalCount = LaserCount * UsedMeasurementsPerRotation;
             PointCloudBuffer = new ComputeBuffer(totalCount, UnsafeUtility.SizeOf<Vector4>());
-            Points = new Vector4[totalCount];
+            ReadbackPool.Resize(totalCount);
 
             if (PointCloudMaterial != null)
                 PointCloudMaterial.SetBuffer(Properties.PointCloud, PointCloudBuffer);
@@ -338,6 +348,7 @@ namespace Simulator.Sensors
 
             CheckTexture();
             CheckCapture();
+            ReadbackPool.Process();
         }
 
         private void CheckTexture()
@@ -365,7 +376,7 @@ namespace Simulator.Sensors
             if (Time.time >= NextCaptureTime)
             {
                 RenderCamera();
-                SendMessage();
+                ReadbackPool.StartReadback(PointCloudBuffer);
 
                 if (NextCaptureTime < Time.time - Time.deltaTime)
                 {
@@ -378,7 +389,7 @@ namespace Simulator.Sensors
             }
         }
 
-        private void SendMessage()
+        private void OnReadbackComplete(GpuReadbackData<Vector4> data)
         {
             if (!(Bridge is {Status: Status.Connected}))
                 return;
@@ -389,23 +400,21 @@ namespace Simulator.Sensors
                 worldToLocal = worldToLocal * transform.worldToLocalMatrix;
             }
 
-            PointCloudBuffer.GetData(Points);
-
-            Task.Run(() =>
+            var message = new PointCloudData()
             {
-                Publish(new PointCloudData()
-                {
-                    Name = Name,
-                    Frame = Frame,
-                    Time = SimulatorManager.Instance.CurrentTime,
-                    Sequence = Sequence++,
+                Name = Name,
+                Frame = Frame,
+                Time = data.captureTime,
+                Sequence = Sequence,
 
-                    LaserCount = CurrentLaserCount,
-                    Transform = worldToLocal,
-                    Points = Points,
-                    PointCount = Points.Length
-                });
-            });
+                LaserCount = CurrentLaserCount,
+                Transform = worldToLocal,
+                NativePoints = data.gpuData,
+                PointCount = data.gpuData.Length
+            };
+
+            if (BridgeMessageDispatcher.Instance.TryQueueTask(Publish, message))
+                Sequence++;
         }
 
         public override void OnVisualize(Visualizer visualizer)
